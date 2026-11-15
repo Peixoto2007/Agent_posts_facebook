@@ -3,6 +3,7 @@ from google import genai
 from google.genai import types
 import asyncio
 import os
+import random
 import time
 import mysql.connector
 import requests
@@ -36,6 +37,10 @@ MIME_TYPES = {
     ".mov": "video/quicktime",
 }
 LIMITE_INLINE_BYTES = 20 * 1024 * 1024  # acima disso o Gemini recebe via Files API
+# Legendas geradas por gerar_legenda, por nome de arquivo. A publicação usa esta cópia exata,
+# porque o texto repassado pelo modelo do agente pode corromper emojis (aparecem como "�").
+_LEGENDAS: dict[str, str] = {}
+
 # Tempo máximo (segundos) de cada chamada do Gemini ao gerar a legenda.
 TIMEOUT_LEGENDA_S = int(os.getenv("GEMINI_TIMEOUT_LEGENDA_S", "30"))
 
@@ -125,6 +130,7 @@ def varrer_proxima_midia() -> str:
         return f"Erro ao conectar no MySQL: {e}"
 
     travadas = []
+    disponiveis = []  # (nome, caminho, já_registrada_no_banco)
     try:
         cur = conn.cursor()
         for nome in arquivos:
@@ -141,7 +147,12 @@ def varrer_proxima_midia() -> str:
                 travadas.append(nome)
                 continue
 
-            if row is None:
+            disponiveis.append((nome, caminho, row is not None))
+
+        if disponiveis:
+            # Sorteia entre todas as mídias que ainda não foram publicadas.
+            nome, caminho, registrada = random.choice(disponiveis)
+            if not registrada:
                 cur.execute(
                     "INSERT INTO historico_posts (filepath, status) VALUES (%s, 'pendente')",
                     (caminho,),
@@ -213,7 +224,7 @@ def gerar_legenda(nome_arquivo: str, instrucoes_extras: str = "") -> str:
 
     prompt = (
         "Você é um copywriter de redes sociais. Analise a mídia anexada e escreva UMA "
-        "legenda de vendas curta e atraente em português do Brasil para o Facebook.\n"
+        "legenda de vendas *curta* e atraente em português do Brasil para o Facebook.\n"
         f"Briefing do negócio: {BRIEFING_NEGOCIO}\n"
         "Regras: fale do que realmente aparece na mídia; no máximo 600 caracteres; até 3 "
         "emojis; sem markdown; não invente preços nem promoções. Responda só com a legenda."
@@ -222,7 +233,7 @@ def gerar_legenda(nome_arquivo: str, instrucoes_extras: str = "") -> str:
         prompt += f"\nAjustes pedidos (prioridade): {instrucoes_extras}"
 
     try:
-        # usa GOOGLE_API_KEY do ambiente; timeout em milissegundos
+        
         client = genai.Client(http_options=types.HttpOptions(timeout=TIMEOUT_LEGENDA_S * 1000))
         if os.path.getsize(caminho) <= LIMITE_INLINE_BYTES:
             with open(caminho, "rb") as f:
@@ -239,6 +250,7 @@ def gerar_legenda(nome_arquivo: str, instrucoes_extras: str = "") -> str:
         legenda = _gerar_com_retentativa(client, [midia, prompt]).strip('"').strip()
         if not legenda:
             return "Erro: O Gemini retornou uma legenda vazia."
+        _LEGENDAS[os.path.basename(caminho)] = legenda
         return legenda
     except Exception as e:
         return f"Erro ao gerar a legenda com o Gemini: {e}"
@@ -264,12 +276,14 @@ def publicar_no_facebook(caption: str, nome_arquivo: str) -> str:
     if not os.path.exists(media_path):
         return f"Erro: O arquivo de mídia não foi encontrado: {media_path}"
 
+    
+    caption = _LEGENDAS.get(os.path.basename(media_path)) or caption
+
     ext = os.path.splitext(media_path)[1].lower()
     if ext not in EXTENSOES_VALIDAS:
         return f"Erro: Extensão não suportada: {ext}"
     is_video = ext in EXTENSOES_VIDEO
 
-    # Trava contra duplicidade: confere o status e marca 'publicando' ANTES de chamar a Meta.
     try:
         conn = _conectar()
         try:
@@ -306,11 +320,11 @@ def publicar_no_facebook(caption: str, nome_arquivo: str) -> str:
                 url, data=payload, files={"source": media_file}, timeout=timeout
             )
     except requests.exceptions.ConnectionError as e:
-        # Não chegou à Meta: seguro liberar para nova tentativa.
+        
         _liberar_para_nova_tentativa(media_path)
         return f"Erro: Sem conexão com a Graph API do Facebook: {e}"
     except requests.exceptions.Timeout:
-        # Pode ter sido publicado mesmo assim: fica 'publicando' para não duplicar.
+        
         return (
             "Erro: A chamada para a Graph API excedeu o tempo limite. O post PODE ter sido criado; "
             "confira na Página. A mídia ficou com status 'publicando' e não será reenviada sozinha."
@@ -332,7 +346,7 @@ def publicar_no_facebook(caption: str, nome_arquivo: str) -> str:
         erro_msg = res_data.get("error", {}).get("message", response.text[:300])
         return f"Falha na Graph API da Meta: {erro_msg}"
 
-    # Em fotos, 'post_id' é o post na Página e 'id' é o ID da foto.
+
     post_id = res_data.get("post_id") or res_data.get("id")
 
     try:
@@ -352,12 +366,12 @@ def _liberar_para_nova_tentativa(media_path: str) -> None:
     try:
         _definir_status(media_path, "pendente")
     except mysql.connector.Error:
-        pass  # fica 'publicando'; o usuário será avisado na próxima varredura
+        pass  
 
 
-# --- Modelo do agente com fallback em tempo real ------------------------------
 
-# Segundos esperando a 1ª resposta do modelo principal antes de trocar para o reserva.
+
+
 TIMEOUT_PRIMEIRA_RESPOSTA = float(os.getenv("GEMINI_TIMEOUT_S", "25"))
 
 
@@ -429,7 +443,7 @@ root_agent = Agent(
     description="Agente autônomo para automação de publicações em mídias sociais.",
     instruction=(
         "Você é um assistente de automação de mídias sociais. "
-        "Quando o usuário digitar 'fazer' ou pedir uma postagem, siga este fluxo: "
+        "Leia o arquivo txt 'briefinf_negocio'para Quando o usuário digitar 'fazer' ou pedir uma postagem, você siga este fluxo e fazer da melhor forma: "
         "1) chame varrer_proxima_midia para descobrir qual mídia postar; "
         "2) se ela retornar um nome_arquivo, chame gerar_legenda com esse nome EXATO; "
         "3) se a legenda não começar com 'Erro', chame publicar_no_facebook com a legenda "
